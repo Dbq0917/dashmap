@@ -87,8 +87,9 @@ impl<'a, 'q, K: Eq + Hash + From<&'q Q>, Q, V> EntryRef<'a, 'q, K, Q, V> {
     pub fn insert(self, value: V) -> RefMut<'a, K, V> {
         match self {
             EntryRef::Occupied(mut entry) => {
-                entry.insert(value);
-                entry.into_ref()
+                let old = entry.insert(value);
+                // Drop the replaced value only after the shard lock is released.
+                entry.into_ref().defer_drop(Some(old))
             }
             EntryRef::Vacant(entry) => entry.insert(value),
         }
@@ -106,7 +107,9 @@ impl<'a, 'q, K: Eq + Hash + From<&'q Q>, Q, V> EntryRef<'a, 'q, K, Q, V> {
     {
         match self {
             EntryRef::Occupied(mut entry) => {
-                entry.insert(value);
+                let old = entry.insert(value);
+                // Drop the replaced value only after the shard lock is released.
+                entry.deferred = Some(old);
                 entry
             }
             EntryRef::Vacant(entry) => entry.insert_entry(value),
@@ -166,6 +169,9 @@ pub struct OccupiedEntryRef<'a, 'q, K, Q, V> {
     shard: RwLockWriteGuardDetached<'a>,
     entry: hash_table::OccupiedEntry<'a, (K, V)>,
     key: &'q Q,
+    // Value replaced by `EntryRef::insert_entry`. Declared after `shard` so
+    // that it is dropped only after the shard lock has been released.
+    deferred: Option<V>,
 }
 
 impl<'a, 'q, K: Eq + Hash, Q, V> OccupiedEntryRef<'a, 'q, K, Q, V> {
@@ -174,7 +180,12 @@ impl<'a, 'q, K: Eq + Hash, Q, V> OccupiedEntryRef<'a, 'q, K, Q, V> {
         key: &'q Q,
         entry: hash_table::OccupiedEntry<'a, (K, V)>,
     ) -> Self {
-        Self { shard, entry, key }
+        Self {
+            shard,
+            entry,
+            key,
+            deferred: None,
+        }
     }
 
     pub fn get(&self) -> &V {
@@ -191,7 +202,7 @@ impl<'a, 'q, K: Eq + Hash, Q, V> OccupiedEntryRef<'a, 'q, K, Q, V> {
 
     pub fn into_ref(self) -> RefMut<'a, K, V> {
         let (k, v) = self.entry.into_mut();
-        RefMut::new(self.shard, k, v)
+        RefMut::new(self.shard, k, v).defer_drop(self.deferred)
     }
 
     pub fn into_key(self) -> K
@@ -206,12 +217,22 @@ impl<'a, 'q, K: Eq + Hash, Q, V> OccupiedEntryRef<'a, 'q, K, Q, V> {
     }
 
     pub fn remove(self) -> V {
-        let ((_k, v), _) = self.entry.remove();
+        let (_k, v) = self.remove_entry();
         v
     }
 
     pub fn remove_entry(self) -> (K, V) {
-        let ((k, v), _) = self.entry.remove();
+        let Self {
+            shard,
+            entry,
+            key: _,
+            deferred,
+        } = self;
+        let ((k, v), _) = entry.remove();
+        // Release the shard lock before dropping any deferred value, so its
+        // destructor cannot deadlock on the held lock.
+        drop(shard);
+        drop(deferred);
         (k, v)
     }
 

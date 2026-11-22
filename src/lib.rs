@@ -1106,7 +1106,14 @@ impl<'a, K: 'a + Eq + Hash, V: 'a, S: 'a + BuildHasher + Clone> DashMap<K, V, S>
 
     fn _retain(&self, mut f: impl FnMut(&K, &mut V) -> bool) {
         self.shards.iter().for_each(|s| {
-            s.write().retain(|(k, v)| f(k, v));
+            // Move the removed entries out of the shard and drop them only
+            // after the shard lock has been released, so that destructors
+            // which access the map cannot deadlock on the still-held lock.
+            let removed = {
+                let mut shard = s.write();
+                shard.extract_if(|(k, v)| !f(k, v)).collect::<Vec<_>>()
+            };
+            drop(removed);
         });
     }
 

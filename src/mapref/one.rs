@@ -7,6 +7,10 @@ pub struct Ref<'a, K, V> {
     _guard: RwLockReadGuardDetached<'a>,
     k: &'a K,
     v: &'a V,
+    // Value replaced through the entry API. Declared after `_guard` so that
+    // it is dropped only after the shard lock has been released, preventing
+    // destructors that access the map from deadlocking on the held lock.
+    deferred: Option<V>,
 }
 
 impl<'a, K: Eq + Hash, V> Ref<'a, K, V> {
@@ -15,6 +19,7 @@ impl<'a, K: Eq + Hash, V> Ref<'a, K, V> {
             _guard: guard,
             k,
             v,
+            deferred: None,
         }
     }
 
@@ -78,11 +83,28 @@ pub struct RefMut<'a, K, V> {
     guard: RwLockWriteGuardDetached<'a>,
     k: &'a K,
     v: &'a mut V,
+    // Value replaced through the entry API. Declared after `guard` so that
+    // it is dropped only after the shard lock has been released, preventing
+    // destructors that access the map from deadlocking on the held lock.
+    deferred: Option<V>,
 }
 
 impl<'a, K: Eq + Hash, V> RefMut<'a, K, V> {
     pub(crate) fn new(guard: RwLockWriteGuardDetached<'a>, k: &'a K, v: &'a mut V) -> Self {
-        Self { guard, k, v }
+        Self {
+            guard,
+            k,
+            v,
+            deferred: None,
+        }
+    }
+
+    /// Defers the drop of `value` until this guard is dropped, i.e. until
+    /// after the shard lock has been released.
+    pub(crate) fn defer_drop(mut self, value: Option<V>) -> Self {
+        debug_assert!(self.deferred.is_none());
+        self.deferred = value;
+        self
     }
 
     pub fn key(&self) -> &K {
@@ -106,11 +128,13 @@ impl<'a, K: Eq + Hash, V> RefMut<'a, K, V> {
     }
 
     pub fn downgrade(self) -> Ref<'a, K, V> {
-        Ref::new(
+        let mut reference = Ref::new(
             unsafe { RwLockWriteGuardDetached::downgrade(self.guard) },
             self.k,
             self.v,
-        )
+        );
+        reference.deferred = self.deferred;
+        reference
     }
 
     pub fn map<F, T: ?Sized>(self, f: F) -> MappedRefMut<'a, K, T>
